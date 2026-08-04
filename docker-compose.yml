@@ -1,0 +1,199 @@
+services:
+
+  # ---------------------------------------------------------------------
+  # Kafka broker, running in KRaft mode (no ZooKeeper).
+  # This single container plays both roles KRaft needs:
+  #   - "broker": stores partition data, serves produce/fetch requests
+  #   - "controller": manages cluster metadata (topics, partitions,
+  #     leadership) via a Raft quorum -- ZooKeeper's old job
+  # In production these roles usually run on separate node pools; for a
+  # single-node dev cluster it's normal, and cheaper, to combine them.
+  # ---------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"   # host-reachable listener, e.g. for a local Python REPL or kcat
+    environment:
+      # --- identity ---
+      KAFKA_NODE_ID: 1
+
+      # --- KRaft roles: this node is both broker and controller ---
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # 1@kafka:9093 = "node id 1 is a controller-quorum voter, reachable
+      # at kafka:9093". With one node this is a quorum of one -- fine for
+      # dev, but it's the same mechanism a 3- or 5-node prod quorum uses.
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # --- network listeners ---
+      # PLAINTEXT     : how other containers on the Docker network reach Kafka
+      # CONTROLLER    : Raft traffic between controller nodes (internal only)
+      # PLAINTEXT_HOST: how the host machine reaches Kafka via localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # --- single-node settings ---
+      # These replication/ISR settings default to 3 in a real cluster.
+      # With one broker, anything above 1 would make Kafka refuse to
+      # create internal topics (it can't replicate to brokers that don't
+      # exist), so they're pinned to 1 here.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data   # so tick history / offsets survive a container restart
+
+    networks:
+      - pricing-net
+
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------
+  # One-shot job: creates our two topics, then exits. Kept separate from
+  # the broker so topic definitions are declarative and version-controlled
+  # rather than something we type into a shell by hand.
+  # ---------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - pricing-net
+    entrypoint: ["/bin/bash", "-c"]
+    # command is a list with ONE item: the whole script as a block-scalar
+    # string. Because it's already a list, Compose passes it straight
+    # through to bash -c as a single argument, instead of re-tokenizing
+    # a plain string itself (which is what broke the previous version).
+    command:
+      - |
+        set -e
+        echo 'Creating topic: market-ticks'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic market-ticks \
+          --partitions 3 --replication-factor 1
+
+        echo 'Creating topic: pricing-signals'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic pricing-signals \
+          --partitions 1 --replication-factor 1
+
+        echo 'Topics now on the cluster:'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # Publishes ticks to market-ticks. build.context is the project ROOT
+  # (not producer/), because producer/Dockerfile needs to COPY common/
+  # too -- Docker can only see files inside its build context, and that
+  # context is set per-service here, separate from where the Dockerfile
+  # itself lives (dockerfile:).
+  # ---------------------------------------------------------------------
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    container_name: producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully   # wait for topics to exist, not just for kafka to be up
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TICK_TOPIC: market-ticks
+      PRODUCER_MODE: simulate     # flip to "coinbase" for real market data -- see producer.py
+      SYMBOLS: BTC-USD,ETH-USD,SOL-USD
+      TICK_INTERVAL_SEC: "0.2"
+    networks:
+      - pricing-net
+
+  # ---------------------------------------------------------------------
+  # First of three independent readers of market-ticks. Its consumer
+  # group id (pricing-group, set in the Dockerfile's env) is what makes
+  # it independent of the risk and persistence consumers we'll add next
+  # -- each group gets its own copy of every message and its own offset
+  # checkpoint.
+  # ---------------------------------------------------------------------
+  pricing-consumer:
+    build:
+      context: .
+      dockerfile: consumers/pricing/Dockerfile
+    container_name: pricing-consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TICK_TOPIC: market-ticks
+      SIGNAL_TOPIC: pricing-signals
+      CONSUMER_GROUP: pricing-group
+      WINDOW_SIZE: "20"
+    networks:
+      - pricing-net
+
+  # ---------------------------------------------------------------------
+  # Second independent reader of market-ticks. Own consumer group
+  # (risk-group) means it has its own offset checkpoint, entirely
+  # separate from pricing-group -- killing this container has zero
+  # effect on the pricing consumer's progress, and vice versa.
+  # ---------------------------------------------------------------------
+  risk-consumer:
+    build:
+      context: .
+      dockerfile: consumers/risk/Dockerfile
+    container_name: risk-consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TICK_TOPIC: market-ticks
+      CONSUMER_GROUP: risk-group
+      RISK_THRESHOLD_PCT: "0.002"
+    networks:
+      - pricing-net
+
+  # ---------------------------------------------------------------------
+  # Third independent reader of market-ticks. Writes batched Parquet
+  # files to ./data on your actual machine via the bind mount below --
+  # without it, the files would only exist inside the container and
+  # vanish with `docker compose down`.
+  # ---------------------------------------------------------------------
+  persistence-consumer:
+    build:
+      context: .
+      dockerfile: consumers/persistence/Dockerfile
+    container_name: persistence-consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TICK_TOPIC: market-ticks
+      CONSUMER_GROUP: persistence-group
+      BATCH_SIZE: "200"
+      FLUSH_INTERVAL_SEC: "10"
+      OUTPUT_DIR: /app/data/market_ticks
+    volumes:
+      - ./data:/app/data
+    networks:
+      - pricing-net
+
+networks:
+  pricing-net:
+    driver: bridge
+
+volumes:
+  kafka-data:

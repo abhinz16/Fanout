@@ -1,0 +1,2 @@
+confluent-kafka>=2.3.0
+pyarrow>=14.0.0
